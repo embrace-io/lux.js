@@ -1,200 +1,408 @@
 import { LogEvent, type LogEventRecord } from "../../src/logger";
-import { getNavTiming } from "../../tests/helpers/lux";
-import { getMessageForEvent, isBeaconEvent } from "./events";
-import { getFilters } from "./filters";
+import { analyse, parseInput, type Analysis, type PageView } from "./analyse";
+import { buildConfigDetails, buildMainBeaconDetails, buildPostBeaconDetails } from "./details";
+import { getEventCategory, getMessageForEvent } from "./events";
+import { getFilters, isEventVisible } from "./filters";
 
-const input = document.querySelector("#input") as HTMLTextAreaElement;
-const eventCounter = document.querySelector("#event-counter") as HTMLSpanElement;
-const output = document.querySelector("#output");
-const parseBtn = document.querySelector("#parse");
-const filterInputs = document.querySelectorAll(".event-filter") as NodeListOf<HTMLInputElement>;
+const STORAGE_KEY = "lux-debug-parser-input";
+const THEME_KEY = "lux-debug-parser-theme";
 
-if (!input || !output || !parseBtn) {
-  throw new Error("Cannot start debug parser.");
-}
+const input = query<HTMLTextAreaElement>("#input");
+const inputSection = query<HTMLDetailsElement>("#input-section");
+const inputSummary = query<HTMLElement>("#input-summary");
+const parseBtn = query<HTMLButtonElement>("#parse");
+const clearBtn = query<HTMLButtonElement>("#clear");
+const copyBtn = query<HTMLButtonElement>("#copy");
+const errorEl = query<HTMLElement>("#error");
+const results = query<HTMLElement>("#results");
+const summary = query<HTMLElement>("#summary");
+const search = query<HTMLInputElement>("#search");
+const output = query<HTMLElement>("#output");
+const filterInputs = document.querySelectorAll<HTMLInputElement>(".event-filter");
+const themeSelect = query<HTMLSelectElement>("#theme");
 
-parseBtn.addEventListener("click", () => renderOutput(output));
-filterInputs.forEach((input) => {
-  input.addEventListener("change", () => renderOutput(output));
+let analysis: Analysis | null = null;
+let parseTimeout: ReturnType<typeof setTimeout> | undefined;
+
+parseBtn.addEventListener("click", () => parse());
+clearBtn.addEventListener("click", () => {
+  input.value = "";
+  saveInput();
+  parse();
+  input.focus();
+});
+copyBtn.addEventListener("click", copyAsText);
+search.addEventListener("input", applySearch);
+filterInputs.forEach((el) => el.addEventListener("change", render));
+
+input.addEventListener("input", () => {
+  saveInput();
+  clearTimeout(parseTimeout);
+  parseTimeout = setTimeout(parse, 300);
 });
 
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    parse();
+  }
+});
+
+themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
+applyTheme(readStorage(THEME_KEY));
+restoreInput();
+
 if (input.value) {
-  // Initial render if there is already input
-  renderOutput(output);
+  parse();
 }
 
-function renderOutput(output: Element) {
-  output.innerHTML = "";
-
-  let inputEvents: LogEventRecord[] = [];
+function parse() {
+  let events: LogEventRecord[];
 
   try {
-    inputEvents = JSON.parse(input.value);
+    events = parseInput(input.value);
   } catch (err) {
-    output.appendChild(li(`Could not parse input: ${err}`, "red"));
+    analysis = null;
+    showError(input.value.trim() ? (err as Error).message : "");
+    render();
+    return;
   }
 
-  const sentBeacons = inputEvents.filter((event) => event[1] === LogEvent.MainBeaconSent);
+  analysis = analyse(events);
+  showError("");
+  inputSection.open = false;
+  render();
+}
 
-  eventCounter.innerText = `(${inputEvents.length} events; ${sentBeacons.length} page views)`;
+function render() {
+  output.innerHTML = "";
 
-  let navigationStart = Number(new Date(inputEvents[0][0]));
-
-  for (const event of inputEvents) {
-    if (event[1] === LogEvent.NavigationStart) {
-      // Always show the navigation start event first
-      navigationStart = (event[2] as [number])[0];
-      break;
-    }
+  if (!analysis) {
+    results.hidden = true;
+    inputSummary.textContent = "";
+    return;
   }
 
-  let lastInit = navigationStart;
-  let dataCollectionFinished = false;
+  const eventCount = analysis.pageViews.reduce((n, pv) => n + pv.events.length, 0);
   const filters = getFilters(filterInputs);
+  const showBeaconUrl = filters.includes("beaconUrl");
 
-  inputEvents.forEach((event, eventIndex) => {
-    const timestamp = Number(new Date(event[0])) - navigationStart;
-    const message = getMessageForEvent(event, filters);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const args = event[2] as any[];
+  results.hidden = false;
+  inputSummary.textContent = `${plural(eventCount, "event")} pasted`;
+  renderSummary(analysis, eventCount);
 
-    if (message) {
-      if (isBeaconEvent(event[1])) {
-        const item = li(`${new Intl.NumberFormat().format(timestamp)} ms: ${message}`);
-        item.classList.add("tooltip-container");
-
-        const beaconUrl = new URL(args[0]);
-        const NT = getNavTiming(beaconUrl);
-        const tooltip = document.createElement("div");
-        tooltip.className = "tooltip";
-        tooltip.innerHTML = `
-          <div class="tooltip-inner">
-            <b>Page label:</b> ${beaconUrl.searchParams.get("l")}<br>
-            <b>Hostname:</b> ${beaconUrl.searchParams.get("HN")}<br>
-            <b>Path:</b> ${beaconUrl.searchParams.get("PN")}<br>
-            <b>lux.js version:</b> ${beaconUrl.searchParams.get("v")}<br>
-            <hr>
-            <b>LCP:</b> ${NT.largestContentfulPaint}<br>
-            <b>CLS:</b> ${beaconUrl.searchParams.get("DCLS")}<br>
-            <b>INP:</b> ${beaconUrl.searchParams.get("INP")}<br>
-            <b>FID:</b> ${beaconUrl.searchParams.get("FID")}<br>
-          </div>
-        `;
-
-        item.appendChild(tooltip);
-        output.appendChild(item);
-      } else if (event[1] === LogEvent.EvaluationStart) {
-        // Support for EvaluationStart event containing LUX config (since v313)
-        const item = li(
-          `${new Intl.NumberFormat().format(
-            timestamp,
-          )} ms: ${message} Hover to view configuration.`,
-        );
-        item.classList.add("tooltip-container");
-
-        let config = args[1];
-        try {
-          config = JSON.parse(config);
-        } catch {
-          // Ignore
-        }
-
-        const tooltip = document.createElement("div");
-        tooltip.className = "tooltip";
-        tooltip.innerHTML = `
-          <div class="tooltip-inner">
-            <pre>${JSON.stringify(config, null, 4)}</pre>
-          </div>
-        `;
-
-        item.appendChild(tooltip);
-        output.appendChild(item);
-      } else if (event[1] === LogEvent.PostBeaconSent) {
-        const item = li(
-          `${new Intl.NumberFormat().format(timestamp)} ms: ${message} Hover to view data.`,
-        );
-        item.classList.add("tooltip-container");
-
-        let payload = args[1];
-        try {
-          payload = JSON.parse(payload);
-        } catch {
-          // Ignore
-        }
-
-        const tooltip = document.createElement("div");
-        tooltip.className = "tooltip";
-        tooltip.innerHTML = `
-          <div class="tooltip-inner">
-            <pre>${JSON.stringify(payload, null, 4)}</pre>
-          </div>
-        `;
-
-        item.appendChild(tooltip);
-        output.appendChild(item);
-      } else {
-        output.appendChild(li(`${new Intl.NumberFormat().format(timestamp)} ms: ${message}`));
-      }
-
-      // Track when data collection has finished
-      if (event[1] === LogEvent.DataCollectionStart) {
-        dataCollectionFinished = true;
-      }
-
-      // Track when a new beacon is initialised
-      if (event[1] === LogEvent.InitCalled) {
-        lastInit = event[0];
-        dataCollectionFinished = false;
-      }
-
-      // Warn when data was gathered for less than 1 second
-      if (event[1] === LogEvent.SendCalled) {
-        const sendTime = event[0];
-        const measureTime = sendTime - lastInit;
-
-        if (measureTime < 1000) {
-          output.appendChild(
-            li(
-              `${new Intl.NumberFormat().format(
-                timestamp,
-              )} ms: ⚠️ Data was gathered for less than 1 second. Consider increasing the value of LUX.minMeasureTime.`,
-            ),
-          );
-        }
-      }
-
-      // Warn when performance entries occur after data collection has finished
-      if (dataCollectionFinished && event[1] === LogEvent.PerformanceEntryReceived) {
-        const nextEvent = inputEvents[eventIndex + 1];
-
-        // Only show the warning once for multiple performance entries
-        if (nextEvent[1] !== LogEvent.PerformanceEntryReceived) {
-          output.appendChild(
-            li(
-              `${new Intl.NumberFormat().format(
-                timestamp,
-              )} ms: ⚠️ Performance entries were received after the beacon was sent.`,
-            ),
-          );
-        }
-      }
-    }
+  analysis.pageViews.forEach((pageView, i) => {
+    output.appendChild(renderPageView(pageView, i, filters, showBeaconUrl));
   });
 
-  const startTime = new Date(navigationStart);
+  applySearch();
+}
 
-  output.prepend(
-    li(
-      `0 ms: 🟢 Navigation started at ${startTime.toLocaleDateString()} ${startTime.toLocaleTimeString()}`,
-    ),
+function renderSummary(analysis: Analysis, eventCount: number) {
+  summary.innerHTML = "";
+
+  const started = new Date(analysis.navigationStart);
+  const beaconsSent = analysis.pageViews.filter((pv) => pv.beaconSent).length;
+
+  const parts: [string, string][] = [
+    ["", plural(eventCount, "event")],
+    ["", plural(analysis.pageViews.length, "page view")],
+    ["", `${beaconsSent} with beacons`],
+    ["summary-warn", plural(analysis.warningCount, "warning")],
+    ["summary-error", plural(analysis.errorCount, "error")],
+    ["summary-muted", `Started ${started.toLocaleDateString()} ${started.toLocaleTimeString()}`],
+  ];
+
+  for (const [className, text] of parts) {
+    const el = document.createElement("span");
+    el.className = className;
+    el.textContent = text;
+    summary.appendChild(el);
+  }
+}
+
+function renderPageView(
+  pageView: PageView,
+  index: number,
+  filters: string[],
+  showBeaconUrl: boolean,
+): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "page-view";
+  section.dataset.heading = `Page view ${index + 1} (${describeKind(pageView)})`;
+
+  const header = document.createElement("header");
+  header.className = "page-view-header";
+
+  const heading = document.createElement("h2");
+  heading.textContent = `Page view ${index + 1}`;
+
+  const kind = document.createElement("span");
+  kind.className = "badge";
+  kind.textContent = describeKind(pageView);
+  heading.appendChild(kind);
+
+  const status = document.createElement("span");
+  status.className = pageView.beaconSent ? "status status-sent" : "status status-unsent";
+  status.textContent = pageView.beaconSent
+    ? `Beacon sent at ${formatMs(pageView.sendTime!)}`
+    : "No beacon sent";
+
+  const meta = document.createElement("dl");
+  meta.className = "page-view-meta";
+  const metaRows: [string, string | null][] = [
+    ["Label", pageView.label],
+    ["Host", pageView.hostname],
+    ["Path", pageView.path],
+    ["Started", formatMs(pageView.startTime)],
+    [
+      "Measured",
+      pageView.sendTime !== null ? formatMs(pageView.sendTime - pageView.startTime) : null,
+    ],
+  ];
+
+  for (const [label, value] of metaRows) {
+    if (value === null) {
+      continue;
+    }
+
+    const dt = document.createElement("dt");
+    const dd = document.createElement("dd");
+    dt.textContent = label;
+    dd.textContent = value;
+    meta.append(dt, dd);
+  }
+
+  header.append(heading, status, meta);
+  section.appendChild(header);
+
+  const list = document.createElement("ol");
+  list.className = "events";
+
+  let lastTime: number | null = null;
+
+  for (const event of pageView.events) {
+    const record = event.record;
+
+    if (!isEventVisible(record, filters)) {
+      continue;
+    }
+
+    const message = getMessageForEvent(record, { beaconUrl: showBeaconUrl });
+    const row = renderEventRow(event.time, lastTime, message, getEventCategory(record[1]));
+    const details = renderEventDetails(record);
+
+    if (details) {
+      row.querySelector(".event-body")!.appendChild(details);
+    }
+
+    if (event.cls !== null) {
+      const cls = document.createElement("span");
+      cls.className = "event-note";
+      cls.textContent = `CLS so far: ${event.cls.toFixed(3)}`;
+      row.querySelector(".event-body")!.appendChild(cls);
+    }
+
+    list.appendChild(row);
+    lastTime = event.time;
+
+    for (const warning of event.warnings) {
+      list.appendChild(renderEventRow(event.time, event.time, warning, "warn", true));
+    }
+  }
+
+  if (!list.children.length) {
+    const empty = document.createElement("li");
+    empty.className = "events-empty";
+    empty.textContent = "No events match the current filters.";
+    list.appendChild(empty);
+  }
+
+  section.appendChild(list);
+
+  return section;
+}
+
+function renderEventRow(
+  time: number,
+  lastTime: number | null,
+  message: string,
+  category: string,
+  isWarning = false,
+): HTMLLIElement {
+  const li = document.createElement("li");
+  li.className = `event event-${category}${isWarning ? " event-warning-row" : ""}`;
+  li.dataset.text = `${formatMs(time)}  ${message}`;
+
+  const timeEl = document.createElement("span");
+  timeEl.className = "event-time";
+  timeEl.textContent = formatMs(time);
+
+  const deltaEl = document.createElement("span");
+  deltaEl.className = "event-delta";
+
+  if (lastTime !== null && !isWarning) {
+    const delta = time - lastTime;
+    deltaEl.textContent = delta > 0 ? `+${new Intl.NumberFormat().format(delta)}` : "";
+
+    if (delta >= 1000) {
+      deltaEl.classList.add("event-delta-large");
+    }
+  }
+
+  const body = document.createElement("div");
+  body.className = "event-body";
+
+  const messageEl = document.createElement("span");
+  messageEl.className = "event-message";
+  messageEl.textContent = message;
+  body.appendChild(messageEl);
+
+  li.append(timeEl, deltaEl, body);
+
+  return li;
+}
+
+function renderEventDetails(record: LogEventRecord): HTMLElement | null {
+  const args = record[2] as unknown[];
+
+  switch (record[1]) {
+    case LogEvent.EvaluationStart:
+      return args.length > 1 ? buildConfigDetails(args[1]) : null;
+
+    case LogEvent.MainBeaconSent:
+      return buildMainBeaconDetails(String(args[0]));
+
+    case LogEvent.PostBeaconSent:
+    case LogEvent.PostBeaconSendFailed:
+      return buildPostBeaconDetails(String(args[0]), args[1]);
+  }
+
+  return null;
+}
+
+function describeKind(pageView: PageView): string {
+  switch (pageView.kind) {
+    case "navigation":
+      return "Navigation";
+    case "init":
+      return "LUX.init()";
+    case "softNavigation":
+      return "Soft navigation";
+    case "bfCacheRestore":
+      return "Back/forward cache";
+  }
+}
+
+function applySearch() {
+  const term = search.value.trim().toLowerCase();
+  const rows = output.querySelectorAll<HTMLLIElement>(".event");
+
+  rows.forEach((row) => {
+    row.hidden = term !== "" && !(row.dataset.text || "").toLowerCase().includes(term);
+  });
+}
+
+function copyAsText() {
+  const lines: string[] = [];
+
+  output.querySelectorAll<HTMLElement>(".page-view").forEach((section) => {
+    const heading = section.dataset.heading;
+    const status = section.querySelector(".status")!.textContent;
+    const meta: string[] = [];
+
+    section.querySelectorAll(".page-view-meta dt").forEach((dt) => {
+      meta.push(`${dt.textContent}: ${dt.nextElementSibling!.textContent}`);
+    });
+
+    if (lines.length) {
+      lines.push("");
+    }
+
+    lines.push(`## ${heading}: ${status}`, ...meta, "");
+
+    section.querySelectorAll<HTMLLIElement>(".event").forEach((row) => {
+      if (!row.hidden) {
+        lines.push(row.dataset.text || "");
+      }
+    });
+  });
+
+  navigator.clipboard.writeText(lines.join("\n")).then(
+    () => flashButton(copyBtn, "Copied"),
+    () => flashButton(copyBtn, "Copy failed"),
   );
 }
 
-function li(textContent: string, className?: string): HTMLLIElement {
-  const el = document.createElement("li");
+function flashButton(button: HTMLButtonElement, text: string) {
+  const original = button.textContent;
+  button.textContent = text;
+  setTimeout(() => (button.textContent = original), 1500);
+}
 
-  el.textContent = textContent;
-  el.className = className || "";
+function showError(message: string) {
+  errorEl.textContent = message;
+  errorEl.hidden = !message;
+}
+
+function applyTheme(theme: string) {
+  themeSelect.value = theme;
+  writeStorage(THEME_KEY, theme);
+
+  if (theme) {
+    document.documentElement.dataset.theme = theme;
+  } else {
+    delete document.documentElement.dataset.theme;
+  }
+}
+
+function saveInput() {
+  writeStorage(STORAGE_KEY, input.value);
+}
+
+function restoreInput() {
+  const saved = readStorage(STORAGE_KEY);
+
+  if (saved && !input.value) {
+    input.value = saved;
+  }
+}
+
+function readStorage(key: string): string {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch {
+    // Storage may be unavailable in private browsing
+    return "";
+  }
+}
+
+function writeStorage(key: string, value: string) {
+  try {
+    if (value) {
+      localStorage.setItem(key, value);
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // Storage may be unavailable in private browsing
+  }
+}
+
+function formatMs(value: number): string {
+  return `${new Intl.NumberFormat().format(Math.round(value))} ms`;
+}
+
+function plural(count: number, noun: string): string {
+  return `${new Intl.NumberFormat().format(count)} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function query<T extends Element>(selector: string): T {
+  const el = document.querySelector<T>(selector);
+
+  if (!el) {
+    throw new Error(`Cannot start debug parser: missing ${selector}`);
+  }
 
   return el;
 }

@@ -1,5 +1,19 @@
 import { LogEvent, type LogEventRecord } from "../../src/logger";
 
+export type EventCategory =
+  | "pageview"
+  | "beacon"
+  | "error"
+  | "warn"
+  | "metric"
+  | "api"
+  | "verbose"
+  | "info";
+
+export interface MessageOptions {
+  beaconUrl?: boolean;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function argsAsString(args: any[]): string {
   return args.map((v) => JSON.stringify(v)).join(", ");
@@ -14,23 +28,67 @@ export function isBeaconEvent(event: LogEvent) {
   ].includes(event);
 }
 
-function isVerboseEvent(event: LogEvent) {
-  return [
-    LogEvent.DataCollectionStart,
-    LogEvent.PostBeaconCancelled,
-    LogEvent.PostBeaconCSPViolation,
-    LogEvent.PostBeaconInitialised,
-    LogEvent.PostBeaconSendCalled,
-    LogEvent.PostBeaconStopRecording,
-    LogEvent.PostBeaconTimeoutReached,
-  ].includes(event);
-}
+export function getEventCategory(event: LogEvent): EventCategory {
+  switch (event) {
+    case LogEvent.InitCalled:
+    case LogEvent.StartSoftNavigationCalled:
+    case LogEvent.BfCacheRestore:
+      return "pageview";
 
-export function getMessageForEvent(event: LogEventRecord, filters: string[]): string {
-  if (isVerboseEvent(event[1]) && !filters.includes("verbose")) {
-    return "";
+    case LogEvent.MainBeaconSent:
+    case LogEvent.PostBeaconSent:
+    case LogEvent.UserTimingBeaconSent:
+    case LogEvent.InteractionBeaconSent:
+    case LogEvent.CustomDataBeaconSent:
+      return "beacon";
+
+    case 0 as LogEvent:
+    case LogEvent.PerformanceObserverError:
+    case LogEvent.InputEventPermissionError:
+    case LogEvent.InnerHtmlAccessError:
+    case LogEvent.EventTargetAccessError:
+    case LogEvent.CookieReadError:
+    case LogEvent.CookieSetError:
+    case LogEvent.PageLabelEvaluationError:
+    case LogEvent.PostBeaconSendFailed:
+    case LogEvent.PostBeaconCSPViolation:
+      return "error";
+
+    case LogEvent.SendCancelledPageHidden:
+    case LogEvent.SessionIsNotSampled:
+    case LogEvent.InitCallIgnored:
+    case LogEvent.PostBeaconMetricRejected:
+    case LogEvent.NavTimingNotSupported:
+    case LogEvent.PaintTimingNotSupported:
+      return "warn";
+
+    case LogEvent.PerformanceEntryReceived:
+    case LogEvent.PerformanceEntryProcessed:
+      return "metric";
+
+    case LogEvent.MarkCalled:
+    case LogEvent.MeasureCalled:
+    case LogEvent.AddDataCalled:
+    case LogEvent.MarkLoadTimeCalled:
+    case LogEvent.SendCalled:
+    case LogEvent.ForceSampleCalled:
+    case LogEvent.TrackingParamAdded:
+      return "api";
+
+    case LogEvent.DataCollectionStart:
+    case LogEvent.PostBeaconInitialised:
+    case LogEvent.PostBeaconSendCalled:
+    case LogEvent.PostBeaconTimeoutReached:
+    case LogEvent.PostBeaconCancelled:
+    case LogEvent.PostBeaconStopRecording:
+    case LogEvent.PostBeaconCollector:
+      return "verbose";
   }
 
+  return "info";
+}
+
+export function getMessageForEvent(event: LogEventRecord, options: MessageOptions = {}): string {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const args = event[2] as any[];
 
@@ -40,6 +98,8 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
   if (args.length) {
     message += ` (${argsAsString(args)})`;
   }
+
+  const withUrl = (text: string, url: string) => (options.beaconUrl ? `${text}: ${url}` : text);
 
   switch (event[1]) {
     case 0 as LogEvent:
@@ -52,34 +112,28 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return "lux.js init complete.";
 
     case LogEvent.InitCalled:
-      return "🟢 LUX.init() - new page view started";
+      return "LUX.init() called. This page view ends here.";
+
+    case LogEvent.InitCallIgnored:
+      return "LUX.init() was ignored because the page has not finished loading yet.";
 
     case LogEvent.StartSoftNavigationCalled:
-      return "🟢 LUX.startSoftNavigation() - new page view started";
+      return "LUX.startSoftNavigation() called. This page view ends here.";
+
+    case LogEvent.BfCacheRestore:
+      return "Page was restored from the back/forward cache. This page view ends here.";
 
     case LogEvent.MarkLoadTimeCalled:
-      return `🎯 LUX.markLoadTime(${argsAsString(args)})`;
+      return `LUX.markLoadTime(${argsAsString(args)})`;
 
     case LogEvent.MarkCalled:
-      if (filters.includes("userTiming")) {
-        return `LUX.mark(${argsAsString(args)})`;
-      }
-
-      return "";
+      return `LUX.mark(${argsAsString(args)})`;
 
     case LogEvent.MeasureCalled:
-      if (filters.includes("userTiming")) {
-        return `LUX.measure(${argsAsString(args)})`;
-      }
-
-      return "";
+      return `LUX.measure(${argsAsString(args)})`;
 
     case LogEvent.AddDataCalled:
-      if (filters.includes("addData")) {
-        return `LUX.addData(${argsAsString(args)})`;
-      }
-
-      return "";
+      return `LUX.addData(${argsAsString(args)})`;
 
     case LogEvent.TrackingParamAdded:
       return `Tracking parameter ${args[0]}=${args[1]} picked up automatically`;
@@ -91,7 +145,7 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return "This beacon was not sent because the page visibility was hidden.";
 
     case LogEvent.SendCancelledSpaMode:
-      return "ℹ️ LUX.send() was ignored because SPA Mode is enabled.";
+      return "LUX.send() was ignored because SPA Mode is enabled.";
 
     case LogEvent.ForceSampleCalled:
       return "LUX.forceSample()";
@@ -100,13 +154,13 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return "Preparing to send main beacon. Metrics received after this point may be ignored.";
 
     case LogEvent.UnloadHandlerTriggered:
-      return "⤴️ Unload handler was triggered.";
+      return "Unload handler was triggered.";
 
     case LogEvent.OnloadHandlerTriggered:
       message = `Onload handler was triggered after ${args[0]} ms.`;
 
       if (args[1] > 0) {
-        message += ` Minimum measure time was ${args[1]}`;
+        message += ` Minimum measure time was ${args[1]} ms.`;
       }
 
       return message;
@@ -115,43 +169,19 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return `Sample rate is ${args[0]}%. This session is being sampled.`;
 
     case LogEvent.SessionIsNotSampled:
-      return `Sample rate is ${args[0]}%. This session is not being sampled.`;
+      return `Sample rate is ${args[0]}%. This session is not being sampled, so no beacons will be sent.`;
 
     case LogEvent.MainBeaconSent:
-      message = "📫 Main beacon sent";
-
-      if (filters.includes("beaconUrl")) {
-        message += `: ${args[0]}`;
-      }
-
-      return message;
+      return withUrl("Main beacon sent", args[0]);
 
     case LogEvent.UserTimingBeaconSent:
-      message = "📧 Supplementary user timing beacon sent";
-
-      if (filters.includes("beaconUrl")) {
-        message += `: ${args[0]}`;
-      }
-
-      return message;
+      return withUrl("Supplementary user timing beacon sent", args[0]);
 
     case LogEvent.InteractionBeaconSent:
-      message = "📧 Supplementary user interaction beacon sent";
-
-      if (filters.includes("beaconUrl")) {
-        message += `: ${args[0]}`;
-      }
-
-      return message;
+      return withUrl("Supplementary user interaction beacon sent", args[0]);
 
     case LogEvent.CustomDataBeaconSent:
-      message = "📧 Supplementary custom data beacon sent";
-
-      if (filters.includes("beaconUrl")) {
-        message += `: ${args[0]}`;
-      }
-
-      return message;
+      return withUrl("Supplementary custom data beacon sent", args[0]);
 
     case LogEvent.PostBeaconInitialised:
       return "POST beacon initialised.";
@@ -163,21 +193,13 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return "POST beacon maximum measure timeout reached.";
 
     case LogEvent.PostBeaconSent:
-      if (filters.includes("beaconUrl")) {
-        return `📫 POST beacon sent: ${args[0]}`;
-      }
-
-      return "📫 POST beacon sent.";
+      return withUrl("POST beacon sent", args[0]);
 
     case LogEvent.PostBeaconSendFailed:
-      if (filters.includes("beaconUrl")) {
-        return `⚠️ POST beacon send failed: ${args[0]}`;
-      }
-
-      return "⚠️ POST beacon send failed.";
+      return withUrl("POST beacon send failed", args[0]);
 
     case LogEvent.PostBeaconCancelled:
-      return "POST beacon cancelled.";
+      return "POST beacon cancelled because it had no metric data.";
 
     case LogEvent.PostBeaconStopRecording:
       return "POST beacon is no longer recording metrics. Metrics received after this point may be ignored.";
@@ -189,56 +211,20 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
       return "POST beacon cancelled due to CSP violation.";
 
     case LogEvent.PostBeaconCollector:
-      if (filters.includes("metrics")) {
-        return `POST beacon metric collector: ${args[0]} (has data: ${args[1]})`;
-      }
-
-      return "";
+      return `POST beacon metric collector "${args[0]}" ${args[1] ? "has data" : "has no data"}`;
 
     case LogEvent.NavigationStart:
       return "";
 
     case LogEvent.PerformanceEntryReceived:
-      if (!filters.includes("metrics")) {
-        return "";
-      }
-
-      if (args[0].entryType === "layout-shift") {
-        return `Received layout shift at ${args[0].startTime.toFixed()} ms with value of ${args[0].value.toFixed(
-          3,
-        )}`;
-      } else if (args[0].entryType === "longtask") {
-        return `Received long task with duration of ${args[0].duration} ms`;
-      } else if (args[0].entryType === "event") {
-        if (args[0].interactionId === 0) {
-          return `Ignored INP entry with no interaction ID`;
-        } else {
-          return `Received INP entry with duration of ${args[0].duration} ms (ID: ${args[0].interactionId})`;
-        }
-      } else if (args[0].entryType === "first-input") {
-        return `Received FID entry with duration of ${args[0].duration} ms`;
-      } else if (args[0].entryType === "largest-contentful-paint") {
-        return `Received LCP entry at ${args[0].startTime.toFixed()} ms`;
-      } else if (args[0].entryType === "element") {
-        return `Received element timing entry for ${
-          args[0].identifier
-        } at ${args[0].startTime.toFixed()} ms`;
-      }
-
-      message = `Received ${args[0].entryType} entry`;
-
-      if (args[0].startTime) {
-        message += ` at ${args[0].startTime.toFixed()} ms`;
-      }
-
-      return message;
+      return describePerformanceEntry(args[0]);
 
     case LogEvent.PerformanceEntryProcessed:
-      if (filters.includes("metrics") && args[0].entryType === "largest-contentful-paint") {
+      if (args[0].entryType === "largest-contentful-paint") {
         return `Picked LCP from entry at ${args[0].startTime.toFixed()} ms`;
       }
 
-      return "";
+      return `Processed ${args[0].entryType} entry`;
 
     case LogEvent.PerformanceObserverError:
       return `Error while initialising PerformanceObserver: ${args[0]}`;
@@ -266,6 +252,49 @@ export function getMessageForEvent(event: LogEventRecord, filters: string[]): st
 
     case LogEvent.PaintTimingNotSupported:
       return "Start render time could not be determined.";
+  }
+
+  return message;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function describePerformanceEntry(entry: any): string {
+  const at = (value: number) => `${Number(value).toFixed()} ms`;
+
+  switch (entry.entryType) {
+    case "layout-shift":
+      return `Received layout shift at ${at(entry.startTime)} with value of ${entry.value.toFixed(3)}`;
+
+    case "longtask":
+      return `Received long task with duration of ${at(entry.duration)}`;
+
+    case "long-animation-frame":
+      return `Received long animation frame with duration of ${at(entry.duration)}`;
+
+    case "event":
+      if (entry.interactionId === 0) {
+        return `Ignored ${entry.name} event entry with no interaction ID`;
+      }
+
+      return `Received INP entry for ${entry.name} with duration of ${at(entry.duration)} (ID: ${entry.interactionId})`;
+
+    case "first-input":
+      return `Received FID entry for ${entry.name} with duration of ${at(entry.duration)}`;
+
+    case "largest-contentful-paint":
+      return `Received LCP entry at ${at(entry.startTime)}`;
+
+    case "element":
+      return `Received element timing entry for ${entry.identifier} at ${at(entry.startTime)}`;
+
+    case "paint":
+      return `Received ${entry.name} entry at ${at(entry.startTime)}`;
+  }
+
+  let message = `Received ${entry.entryType} entry`;
+
+  if (entry.startTime) {
+    message += ` at ${at(entry.startTime)}`;
   }
 
   return message;
@@ -305,6 +334,8 @@ function getEventName(event: LogEvent) {
       return "SendCancelledSpaMode";
     case LogEvent.BfCacheRestore:
       return "BfCacheRestore";
+    case LogEvent.InitCallIgnored:
+      return "InitCallIgnored";
     case LogEvent.SessionIsSampled:
       return "SessionIsSampled";
     case LogEvent.SessionIsNotSampled:
@@ -365,5 +396,5 @@ function getEventName(event: LogEvent) {
       return "PostBeaconCollector";
   }
 
-  return "Unknown Event";
+  return `Unknown event ${event}`;
 }
